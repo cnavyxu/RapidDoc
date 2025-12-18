@@ -225,3 +225,4 @@ rapid_doc/utils/pdf_text_tool.py
 rapid_doc/utils/span_block_fix.py
 rapid_doc/utils/span_pre_proc.py
 rapid_doc/utils/table_merge.py
+tests/test_modular_api.py
