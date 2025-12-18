@@ -219,7 +219,11 @@ def result_to_middle_json(model_list, images_list, page_dict_list, image_writer,
             lang=lang,
             ocr_config=ocr_config,
         )
-        ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+        ocr_res_list = ocr_model.ocr(
+            img_crop_list,
+            det=False,
+            tqdm_enable=bool(ocr_config.get("tqdm_enable", False)) if ocr_config else False,
+        )[0]
         assert len(ocr_res_list) == len(
             need_ocr_list), f'ocr_res_list: {len(ocr_res_list)}, need_ocr_list: {len(need_ocr_list)}'
         for index, span in enumerate(need_ocr_list):

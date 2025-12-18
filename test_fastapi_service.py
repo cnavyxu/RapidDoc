@@ -58,7 +58,7 @@ def test_model_config():
         
         # 创建配置实例
         config = ModelConfig()
-        print(f"✓ Default configuration created: {config.layout_model_type}")
+        print(f"✓ Default configuration created: use_det_mode={config.use_det_mode}, ocr_rec_batch_num={config.ocr_rec_batch_num}")
         
         # 测试配置字典转换
         layout_config = {
@@ -77,16 +77,15 @@ def test_model_config():
 async def test_model_manager():
     """测试模型管理器"""
     try:
-        print("\nTesting ModelManager...")
+        print("\nTesting ServiceState...")
         
-        from fastapi_service import model_manager, ModelConfig
+        from fastapi_service import ServiceState, ModelConfig
         
-        # 跳过实际的模型初始化（因为需要模型文件）
-        print("⚠️ Skipping actual model initialization (requires model files)")
+        # 跳过实际的模型 warmup（因为需要模型文件）
+        print("⚠️ Skipping actual model warmup (requires model files)")
         
-        # 测试配置
-        default_config = ModelConfig()
-        print(f"✓ Default config ready: {default_config.layout_model_type}")
+        state = ServiceState(ModelConfig())
+        print(f"✓ ServiceState created, pipeline config keys: {list(state.configs.keys())}")
         
         return True
         

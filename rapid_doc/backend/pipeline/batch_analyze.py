@@ -51,6 +51,7 @@ class BatchAnalyze:
         self.layout_base_batch_size = layout_config.get("batch_num", 1) if layout_config else 1 #8
         self.formula_base_batch_size = formula_config.get("batch_num", 1) if formula_config else 1 #16
         self.use_det_mode = ocr_config.get("use_det_mode", 'auto') if ocr_config else 'auto'
+        self.tqdm_enable = bool(ocr_config.get("tqdm_enable", False)) if ocr_config else False
         self.table_config = table_config
         self.table_force_ocr = table_config.get("force_ocr", False) if table_config else False
         self.skip_text_in_image = table_config.get("skip_text_in_image", True) if table_config else True
@@ -60,9 +61,25 @@ class BatchAnalyze:
         self.table_image_enable = table_config.get("table_image_enable", True) if table_config else True
         self.table_extract_original_image = table_config.get("extract_original_image", False) if table_config else False
 
-    def __call__(self, images_with_extra_info: List[Tuple[Image.Image, float, bool, str, dict]]) -> list:
+    def __call__(
+        self,
+        images_with_extra_info: List[Tuple[Image.Image, float, bool, str, dict]],
+        return_metrics: bool = False,
+    ):
         if len(images_with_extra_info) == 0:
-            return []
+            return ([], {}) if return_metrics else []
+
+        metrics: dict = {
+            "pages": len(images_with_extra_info),
+            "layout": {"time": 0.0},
+            "formula": {"time": 0.0},
+            "pdf_det": {"time": 0.0},
+            "ocr_det": {"time": 0.0},
+            "table": {"time": 0.0},
+            "ocr_rec": {"time": 0.0},
+            "total": {"time": 0.0},
+        }
+        total_start = time.perf_counter()
 
         images_layout_res = []
 
@@ -83,9 +100,11 @@ class BatchAnalyze:
 
 
         # 版面识别
+        layout_start = time.perf_counter()
         images_layout_res += self.model.layout_model.batch_predict(
             np_images, self.layout_base_batch_size
         )
+        metrics["layout"]["time"] = time.perf_counter() - layout_start
 
         if self.use_det_mode == 'txt':
             images_layout_res = remove_layout_in_ori_images(images_layout_res, pdf_dict_list, scale_list)
@@ -151,25 +170,34 @@ class BatchAnalyze:
 
         if self.formula_enable:
             # 公式检测
+            formula_start = time.perf_counter()
             latex_imgs = [d['latex_img'] for d in latex_res_list_all_page]
-            latex_results = self.model.formula_model.batch_predict(latex_imgs, batch_size=self.formula_base_batch_size)
+            latex_results = self.model.formula_model.batch_predict(
+                latex_imgs, batch_size=self.formula_base_batch_size
+            )
             for d, res in zip(latex_res_list_all_page, latex_results):
                 if res:
                     d['latex_res']['latex'] = res
                 else:
                     logger.warning('latex recognition processing fails, not get latex return')
+            metrics["formula"]["time"] = time.perf_counter() - formula_start
 
         # 清理显存
         clean_vram(self.model.device, vram_threshold=8)
 
         if self.use_det_mode != 'ocr':
+            pdf_det_start = time.perf_counter()
             # 分页分组
             ocr_res_list_grouped_page = {}
             for x in ocr_res_list_all_page:
                 ocr_res_list_grouped_page.setdefault(x["page_idx"], []).append(x)
             # 计算总数
             total_texts = sum(len(texts) for texts in ocr_res_list_grouped_page.values())
-            with tqdm(total=total_texts, desc="PDF-det Predict") as pbar:
+            with tqdm(
+                total=total_texts,
+                desc="PDF-det Predict",
+                disable=not self.tqdm_enable,
+            ) as pbar:
                 for page_idx, text_list in ocr_res_list_grouped_page.items():
                     if text_list:
                         page_dict = pdf_dict_list[page_idx]
@@ -202,8 +230,10 @@ class BatchAnalyze:
                                 ocr_res_list_dict['layout_res'].extend(ocr_result_list)
                         pbar.update(1)  # 每处理一个更新一次
 
+            metrics["pdf_det"]["time"] = time.perf_counter() - pdf_det_start
 
         # OCR检测处理
+        ocr_det_start = time.perf_counter()
         if self.enable_ocr_det_batch:
             # 批处理模式 - 按语言和分辨率分组
             # 收集所有需要OCR检测的裁剪图像
@@ -275,7 +305,11 @@ class BatchAnalyze:
                     resolution_groups[group_key].append(crop_info)
 
                 # 对每个分辨率组进行批处理
-                for (target_h, target_w), group_crops in tqdm(resolution_groups.items(), desc=f"OCR-det {lang}"):
+                for (target_h, target_w), group_crops in tqdm(
+                    resolution_groups.items(),
+                    desc=f"OCR-det {lang}",
+                    disable=not self.tqdm_enable,
+                ):
                     # 对所有图像进行padding到统一尺寸
                     batch_images = []
                     for crop_info in group_crops:
@@ -314,7 +348,11 @@ class BatchAnalyze:
                                 ocr_res_list_dict['layout_res'].extend(ocr_result_list)
         else:
             # 原始单张处理模式
-            for ocr_res_list_dict in tqdm(ocr_res_list_all_page, desc="OCR-det Predict"):
+            for ocr_res_list_dict in tqdm(
+                ocr_res_list_all_page,
+                desc="OCR-det Predict",
+                disable=not self.tqdm_enable,
+            ):
                 # Process each area that requires OCR processing
                 _lang = ocr_res_list_dict['lang']
                 # Get OCR results for this language's images
@@ -358,15 +396,22 @@ class BatchAnalyze:
                         )
                         ocr_res_list_dict['layout_res'].extend(ocr_result_list)
 
+        metrics["ocr_det"]["time"] = time.perf_counter() - ocr_det_start
+
         # 表格识别 table recognition
         if self.table_enable:
+            table_start = time.perf_counter()
             # 分页分组
             table_res_list_grouped_page = {}
             for x in table_res_list_all_page:
                 table_res_list_grouped_page.setdefault(x["page_idx"], []).append(x)
             # 计算总表格数
             total_tables = sum(len(tables) for tables in table_res_list_grouped_page.values())
-            with tqdm(total=total_tables, desc="Table Predict") as pbar:
+            with tqdm(
+                total=total_tables,
+                desc="Table Predict",
+                disable=not self.tqdm_enable,
+            ) as pbar:
                 for page_idx, table_list in table_res_list_grouped_page.items():
                     page_dict = pdf_dict_list[page_idx]
                     scale = scale_list[page_idx]
@@ -484,10 +529,13 @@ class BatchAnalyze:
                             )
                         pbar.update(1)  # 每处理一个表格更新一次
 
+            metrics["table"]["time"] = time.perf_counter() - table_start
+
         # 清理显存
         clean_vram(self.model.device, vram_threshold=8)
 
         # OCR rec
+        ocr_rec_start = time.perf_counter()
         # Create dictionaries to store items by language
         need_ocr_lists_by_lang = {}  # Dict of lists for each language
         img_crop_lists_by_lang = {}  # Dict of lists for each language
@@ -528,7 +576,11 @@ class BatchAnalyze:
                         lang=lang,
                         ocr_config=self.ocr_config,
                     )
-                    ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+                    ocr_res_list = ocr_model.ocr(
+                        img_crop_list,
+                        det=False,
+                        tqdm_enable=self.tqdm_enable,
+                    )[0]
                     # Verify we have matching counts
                     assert len(ocr_res_list) == len(
                         need_ocr_lists_by_lang[lang]), f'ocr_res_list: {len(ocr_res_list)}, need_ocr_list: {len(need_ocr_lists_by_lang[lang])} for lang: {lang}'
@@ -550,6 +602,11 @@ class BatchAnalyze:
 
                     total_processed += len(img_crop_list)
 
+        metrics["ocr_rec"]["time"] = time.perf_counter() - ocr_rec_start
+        metrics["total"]["time"] = time.perf_counter() - total_start
+
+        if return_metrics:
+            return images_layout_res, metrics
         return images_layout_res
 
 

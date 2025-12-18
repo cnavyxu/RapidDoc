@@ -97,6 +97,7 @@ def doc_analyze(
         formula_config=None,
         table_config=None,
         checkbox_config=None,
+        return_metrics: bool = False,
 ):
     """
     适当调大MIN_BATCH_INFERENCE_SIZE可以提高性能，更大的 MIN_BATCH_INFERENCE_SIZE会消耗更多内存，
@@ -105,6 +106,20 @@ def doc_analyze(
     if lang_list is None:
         lang_list = ["ch"] * len(pdf_bytes_list)
     min_batch_inference_size = int(os.environ.get('MINERU_MIN_BATCH_INFERENCE_SIZE', 384))
+
+    metrics = {
+        "load_images": {"time": 0.0},
+        "pdf_page_extract": {"time": 0.0},
+        "layout": {"time": 0.0},
+        "formula": {"time": 0.0},
+        "pdf_det": {"time": 0.0},
+        "ocr_det": {"time": 0.0},
+        "table": {"time": 0.0},
+        "ocr_rec": {"time": 0.0},
+        "inference_total": {"time": 0.0},
+        "total": {"time": 0.0},
+    }
+    total_start = time.perf_counter()
 
     # 收集所有页面信息
     all_pages_info = []  # 存储(dataset_index, page_index, img, ocr, lang, width, height)
@@ -125,23 +140,24 @@ def doc_analyze(
         _lang = lang_list[pdf_idx]
 
         # 收集每个数据集中的页面
-        # load_images_start = time.time()
+        load_images_start = time.perf_counter()
         images_list, pdf_doc_list = load_images_from_pdf(pdf_bytes, image_type=ImageType.PIL)
-        # load_images_time = round(time.time() - load_images_start, 2)
-        # speed = len(images_list) / (load_images_time + 1e-6)
-        # logger.info(f"load images cost: {round(load_images_time, 4)}, speed: {round(speed, 3)} images/s")
+        metrics["load_images"]["time"] += time.perf_counter() - load_images_start
+
         all_image_lists.append(images_list)
 
+        page_extract_start = time.perf_counter()
         all_pdf_dict = []
         for pdf_doc in pdf_doc_list:
             # 获取pdf的文字和图片的字典对象
             page_dict = get_page(pdf_doc)
             if page_dict['blocks']:
-                page_dict['ori_image_list'] = get_ori_image(pdf_doc) # 从 PDF 中提取所有原始图片
+                page_dict['ori_image_list'] = get_ori_image(pdf_doc)  # 从 PDF 中提取所有原始图片
             else:
-                page_dict['ori_image_list'] = [] # 提取不到文字视为扫描版，不需要提取图片
+                page_dict['ori_image_list'] = []  # 提取不到文字视为扫描版，不需要提取图片
             pdf_doc.close()
             all_pdf_dict.append(page_dict)
+        metrics["pdf_page_extract"]["time"] += time.perf_counter() - page_extract_start
         all_pdf_docs.append(all_pdf_dict)
         for page_idx in range(len(images_list)):
             img_dict = images_list[page_idx]
@@ -167,7 +183,35 @@ def doc_analyze(
             f'Batch {index + 1}/{len(batch_images)}: '
             f'{processed_images_count} pages/{len(images_with_extra_info)} pages'
         )
-        batch_results = batch_image_analyze(batch_image, formula_enable, table_enable, layout_config, ocr_config, formula_config, table_config, checkbox_config)
+        if return_metrics:
+            batch_results, batch_metrics = batch_image_analyze(
+                batch_image,
+                formula_enable,
+                table_enable,
+                layout_config,
+                ocr_config,
+                formula_config,
+                table_config,
+                checkbox_config,
+                return_metrics=True,
+            )
+            for k in ["layout", "formula", "pdf_det", "ocr_det", "table", "ocr_rec"]:
+                metrics[k]["time"] += float(batch_metrics.get(k, {}).get("time", 0.0))
+            metrics["inference_total"]["time"] += float(
+                batch_metrics.get("total", {}).get("time", 0.0)
+            )
+        else:
+            batch_results = batch_image_analyze(
+                batch_image,
+                formula_enable,
+                table_enable,
+                layout_config,
+                ocr_config,
+                formula_config,
+                table_config,
+                checkbox_config,
+            )
+
         results.extend(batch_results)
 
     # 构建返回结果
@@ -185,6 +229,19 @@ def doc_analyze(
 
         infer_results[pdf_idx].append(page_dict)
 
+    if return_metrics:
+        metrics["total"]["time"] = time.perf_counter() - total_start
+        metrics["docs"] = len(pdf_bytes_list)
+        metrics["pages"] = len(all_pages_info)
+        return (
+            infer_results,
+            all_image_lists,
+            all_pdf_docs,
+            lang_list,
+            ocr_enabled_list,
+            metrics,
+        )
+
     return infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list
 
 
@@ -196,7 +253,9 @@ def batch_image_analyze(
         ocr_config=None,
         formula_config=None,
         table_config=None,
-        checkbox_config=None,):
+        checkbox_config=None,
+        return_metrics: bool = False,
+):
 
     from .batch_analyze import BatchAnalyze
 
@@ -241,9 +300,25 @@ def batch_image_analyze(
             logger.info(f'Could not determine GPU memory, using default batch_ratio: {batch_ratio}')
 
     enable_ocr_det_batch = True
-    batch_model = BatchAnalyze(model_manager, batch_ratio, formula_enable, table_enable, enable_ocr_det_batch, layout_config, ocr_config, formula_config, table_config, checkbox_config)
-    results = batch_model(images_with_extra_info)
+    batch_model = BatchAnalyze(
+        model_manager,
+        batch_ratio,
+        formula_enable,
+        table_enable,
+        enable_ocr_det_batch,
+        layout_config,
+        ocr_config,
+        formula_config,
+        table_config,
+        checkbox_config,
+    )
+
+    if return_metrics:
+        results, metrics = batch_model(images_with_extra_info, return_metrics=True)
+    else:
+        results = batch_model(images_with_extra_info)
+        metrics = {}
 
     clean_memory(get_device())
 
-    return results
+    return (results, metrics) if return_metrics else results
